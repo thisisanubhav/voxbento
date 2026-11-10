@@ -7,6 +7,7 @@ import math
 import re
 import secrets
 import urllib.parse
+from collections.abc import Iterable, Sequence
 
 from dataclasses import dataclass
 from datetime import timedelta
@@ -20,6 +21,7 @@ from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import joinedload
 
 from starlette.datastructures import FormData
 
@@ -107,7 +109,14 @@ from portal.models import (
     AuthToken,
     BoothMembership,
     BoothTranslationLanguage,
+    DBBooth,
+    EmailDelivery,
+    EmailTemplate,
+    Event,
+    EventMembership,
+    HostingRequest,
     Room,
+    RoomMembership,
     RoomTranslationLanguage,
     TranscriptSegment,
     TranscriptTranslation,
