@@ -1573,6 +1573,9 @@ class RoomEditValues:
     floor_translation_provider: str | None
     floor_translation_model: str | None
     floor_translation_languages: tuple[str, ...]
+    floor_ai_interpreter_persona: str | None
+    floor_ai_interpretation_style: str | None
+    floor_ai_vocabulary_enabled: bool
     floor_tts_enabled: bool
     floor_tts_provider: str
     floor_tts_voice: str
@@ -1623,6 +1626,9 @@ def _parse_room_edit_values(form: FormData) -> RoomEditValues:
         floor_translation_provider=str(form.get("floor_translation_provider", "")).strip() or None,
         floor_translation_model=str(form.get("floor_translation_model", "")).strip() or None,
         floor_translation_languages=tuple(str(code) for code in form.getlist("floor_translation_languages")),
+        floor_ai_interpreter_persona=str(form.get("floor_ai_interpreter_persona", "")).strip() or None,
+        floor_ai_interpretation_style=str(form.get("floor_ai_interpretation_style", "")).strip() or None,
+        floor_ai_vocabulary_enabled=form.get("floor_ai_vocabulary_enabled") == "on",
         floor_tts_enabled=form.get("floor_tts_enabled") == "on",
         floor_tts_provider=_normalise_tts_provider(form.get("floor_tts_provider")),
         floor_tts_voice=_normalise_tts_voice(form.get("floor_tts_voice")),
@@ -1669,13 +1675,38 @@ def _update_room_translation(session: AsyncSession, room: Room, values: RoomEdit
         )
 
 
+def _update_room_ai(room: Room, values: RoomEditValues, catalog: EngineCatalog) -> None:
+    speech = catalog.find("speech", values.floor_transcription_provider)
+    if speech:
+        model = values.floor_transcription_model
+        allowed = {value for value, _ in ROOM_SPEECH_MODELS.get(speech.provider, ())}
+        room.floor_transcription_provider = speech.provider
+        room.floor_transcription_model = model if model in allowed else speech.model
+    translation = catalog.find("translation", values.floor_translation_provider or "")
+    if translation:
+        model = (values.floor_translation_model or "").strip()[:100]
+        if translation.provider == TranslationProviderEnum.SELF_HOSTED.value:
+            model = settings.self_hosted_llm_model_or_default(model) or ""
+        room.floor_translation_provider = translation.provider
+        room.floor_translation_model = model or translation.model
+    room.floor_ai_interpreter_persona = values.floor_ai_interpreter_persona
+    room.floor_ai_interpretation_style = values.floor_ai_interpretation_style
+    room.floor_ai_vocabulary_enabled = values.floor_ai_vocabulary_enabled
+    voice = catalog.find("voice", values.floor_tts_provider)
+    if voice:
+        room.floor_tts_provider = voice.provider
+        preset = values.floor_tts_voice.upper()
+        if preset in {value for value, _ in ROOM_VOICE_PRESETS}:
+            room.floor_tts_voice = preset
+
+
 def _update_room_tts(room: Room, values: RoomEditValues) -> None:
     room.floor_tts_enabled = values.floor_tts_enabled
     room.floor_tts_provider = values.floor_tts_provider
     room.floor_tts_voice = values.floor_tts_voice
 
 
-def _apply_room_edit(session: AsyncSession, room: Room, values: RoomEditValues) -> None:
+def _apply_room_edit(session: AsyncSession, room: Room, values: RoomEditValues, catalog: EngineCatalog) -> None:
     if _updates_section(values, "general"):
         _update_room_general(room, values)
     if _updates_section(values, "relay"):
@@ -1684,6 +1715,8 @@ def _apply_room_edit(session: AsyncSession, room: Room, values: RoomEditValues) 
         _update_room_transcription(room, values)
     if _updates_section(values, "translation"):
         _update_room_translation(session, room, values)
+    if _updates_section(values, "ai"):
+        _update_room_ai(room, values, catalog)
     if _updates_section(values, "tts"):
         _update_room_tts(room, values)
 
@@ -1693,9 +1726,153 @@ async def admin_edit_room(request: Request, event_id: int, room_id: int):
     values = _parse_room_edit_values(await request.form())
     async with get_session() as session:
         room = await get_room_by_id(session, room_id)
-        if room and room.event_id == event_id:
-            _apply_room_edit(session, room, values)
-            await session.flush()
+        if room is None or room.event_id != event_id:
+            raise HTTPException(status_code=404, detail="Room not found.")
+        event = await get_event_by_id(session, room.event_id)
+        if not event:
+            raise HTTPException(status_code=404, detail="Event not found.")
+        catalog = engine_catalog(event)
+        _apply_room_edit(session, room, values, catalog)
+        await session.flush()
+    return safe_redirect(url=f"/admin/events/{event_id}/rooms/{room_id}/", status_code=status.HTTP_303_SEE_OTHER)
+
+
+def _vocabulary_result_url(event_id: int, room_id: int, imported: int, warnings: list[str], languages: set[str]) -> str:
+    query = urllib.parse.urlencode(
+        {
+            "vocab_imported": imported,
+            "vocab_warnings": " | ".join(warnings[:5]),
+            "vocab_languages": ", ".join(sorted(languages)),
+        }
+    )
+    return f"/admin/events/{event_id}/rooms/{room_id}/?{query}"
+
+
+@router.post(
+    "/admin/events/{event_id}/rooms/{room_id}/ai-vocabulary/upload",
+    dependencies=[Depends(require_event_owner)],
+)
+async def admin_upload_ai_vocabulary(request: Request, event_id: int, room_id: int):
+    form = await request.form()
+    upload = form.get("vocabulary_file")
+    if upload is None or not getattr(upload, "filename", ""):
+        raise HTTPException(status_code=400, detail="Select a vocabulary CSV file.")
+    if not upload.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Vocabulary uploads must be CSV files.")
+    content = await upload.read()
+    if len(content) > 2_000_000:
+        raise HTTPException(status_code=413, detail="Vocabulary CSV files must be 2 MB or smaller.")
+    try:
+        csv_text = content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail="Vocabulary CSV must use UTF-8 encoding.") from exc
+
+    parsed_entries, warnings = parse_vocabulary_csv(csv_text)
+    replace_existing = form.get("import_mode") == "replace"
+    imported = 0
+    languages: set[str] = set()
+    async with get_session() as session:
+        try:
+            await validate_vocabulary_scope(session, event_id, room_id=room_id)
+        except VocabularyScopeError as exc:
+            raise HTTPException(status_code=404, detail="Room not found.") from exc
+        existing_entries = list(
+            await session.scalars(
+                select(AIVocabularyEntry).where(
+                    AIVocabularyEntry.event_id == event_id,
+                    AIVocabularyEntry.room_id == room_id,
+                )
+            )
+        )
+        if replace_existing and parsed_entries:
+            await session.execute(
+                delete(AIVocabularyEntry).where(
+                    AIVocabularyEntry.event_id == event_id,
+                    AIVocabularyEntry.room_id == room_id,
+                )
+            )
+            accepted = VocabularyOverlapIndex()
+        else:
+            accepted = VocabularyOverlapIndex()
+            for existing in existing_entries:
+                accepted.add(existing)
+
+        for entry in parsed_entries:
+            if accepted.conflicts(entry):
+                warnings.append(
+                    f"Existing duplicate: '{entry.source_term}' for target language '{entry.target_language}'"
+                )
+                continue
+            accepted.add(entry)
+            languages.add(entry.target_language)
+            session.add(
+                AIVocabularyEntry(
+                    event_id=event_id,
+                    room_id=room_id,
+                    source_term=entry.source_term,
+                    target_language=entry.target_language,
+                    target_term=entry.target_term,
+                    description=entry.description,
+                    case_sensitive=entry.case_sensitive,
+                    match_type=entry.match_type,
+                    priority=entry.priority,
+                )
+            )
+            imported += 1
+        await session.flush()
+
+    return safe_redirect(
+        url=_vocabulary_result_url(event_id, room_id, imported, warnings, languages),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.get(
+    "/admin/events/{event_id}/rooms/{room_id}/ai-vocabulary/export",
+    dependencies=[Depends(require_owner_or_coordinator)],
+)
+async def admin_export_ai_vocabulary(event_id: int, room_id: int):
+    async with get_session() as session:
+        try:
+            await validate_vocabulary_scope(session, event_id, room_id=room_id)
+        except VocabularyScopeError as exc:
+            raise HTTPException(status_code=404, detail="Room not found.") from exc
+        entries = list(
+            await session.scalars(
+                select(AIVocabularyEntry)
+                .where(AIVocabularyEntry.event_id == event_id, AIVocabularyEntry.room_id == room_id)
+                .order_by(AIVocabularyEntry.priority.desc(), AIVocabularyEntry.source_term)
+            )
+        )
+    return Response(
+        serialize_vocabulary_csv(entries),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="room-{room_id}-ai-vocabulary.csv"'},
+    )
+
+
+@router.post(
+    "/admin/events/{event_id}/rooms/{room_id}/ai-vocabulary/delete",
+    dependencies=[Depends(require_event_owner)],
+)
+async def admin_delete_ai_vocabulary(request: Request, event_id: int, room_id: int):
+    form = await request.form()
+    entry_id = form.get("entry_id", "").strip()
+    async with get_session() as session:
+        try:
+            await validate_vocabulary_scope(session, event_id, room_id=room_id)
+        except VocabularyScopeError as exc:
+            raise HTTPException(status_code=404, detail="Room not found.") from exc
+        statement = delete(AIVocabularyEntry).where(
+            AIVocabularyEntry.event_id == event_id,
+            AIVocabularyEntry.room_id == room_id,
+        )
+        if entry_id != "all":
+            try:
+                statement = statement.where(AIVocabularyEntry.id == int(entry_id))
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid vocabulary entry ID.") from exc
+        await session.execute(statement)
     return safe_redirect(url=f"/admin/events/{event_id}/rooms/{room_id}/", status_code=status.HTTP_303_SEE_OTHER)
 
 
