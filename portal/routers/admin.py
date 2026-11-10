@@ -1688,7 +1688,7 @@ def _apply_room_edit(session: AsyncSession, room: Room, values: RoomEditValues) 
         _update_room_tts(room, values)
 
 
-@router.post("/admin/events/{event_id}/rooms/{room_id}/edit", dependencies=[Depends(require_admin)])
+@router.post("/admin/events/{event_id}/rooms/{room_id}/edit", dependencies=[Depends(require_event_owner)])
 async def admin_edit_room(request: Request, event_id: int, room_id: int):
     values = _parse_room_edit_values(await request.form())
     async with get_session() as session:
